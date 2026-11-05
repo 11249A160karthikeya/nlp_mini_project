@@ -1,29 +1,33 @@
 
-import streamlit as st
-import pymupdf
-import numpy as np
+import os
+import io
+import csv
 import hashlib
 from pathlib import Path
 
+import numpy as np
+import streamlit as st
+import pymupdf
+from docx import Document
+from pptx import Presentation
+from openpyxl import load_workbook
+from sentence_transformers import SentenceTransformer
+from openai import OpenAI
 
 st.set_page_config(
     page_title="SCSVMV AcademicQuery AI",
     page_icon="🎓",
-    layout="wide"
+    layout="wide",
 )
 
-BASE_DIR = Path(__file__).resolve().parent
-LOGO_PATH = BASE_DIR / "assets" / "logo.jpg"
-
+# --------------------------- STYLING ---------------------------
 
 st.markdown("""
 <style>
-.stApp {
-    background-color: #f4f7fc;
-}
+.stApp { background: #f4f7fc; }
 
 [data-testid="stSidebar"] {
-    background-color: #102b50;
+    background: #102b50;
 }
 
 [data-testid="stSidebar"] * {
@@ -32,244 +36,625 @@ st.markdown("""
 
 .main-title {
     color: #102b50;
-    font-size: 36px;
+    font-size: 34px;
     font-weight: 800;
 }
 
-.subtitle {
-    color: #64748b;
-    font-size: 17px;
-}
-
 .hero {
-    background: linear-gradient(120deg, #102b50, #24558a);
-    padding: 35px;
+    background: linear-gradient(120deg,#102b50,#24558a);
+    padding: 28px;
     border-radius: 18px;
     color: white;
-    margin-top: 20px;
-    margin-bottom: 25px;
+    margin: 16px 0 24px;
 }
 
-.hero h1 {
-    color: white;
-    font-size: 32px;
-}
+.hero h1 { color: white; }
+.hero p { color: #e5edf8; font-size: 16px; }
 
-.hero p {
-    color: #e5edf8;
-    font-size: 17px;
-}
-
-.info-card {
-    background-color: white;
-    padding: 24px;
-    border-radius: 15px;
-    border: 1px solid #e1e8f0;
-    min-height: 160px;
-    box-shadow: 0 4px 15px rgba(16,43,80,0.06);
-}
-
-.info-card h3 {
-    color: #102b50;
-}
-
-.info-card p {
-    color: #64748b;
+[data-testid="stChatMessage"] {
+    background: white;
+    border: 1px solid #e5eaf2;
+    border-radius: 14px;
 }
 
 .stButton button {
-    background-color: #173f70;
+    background: #173f70;
     color: white;
     border-radius: 9px;
-    border: none;
-    padding: 10px 20px;
+    border: 0;
 }
 
 .stButton button:hover {
-    background-color: #d5a943;
+    background: #d5a943;
     color: #102b50;
-}
-
-[data-testid="stChatMessage"] {
-    background-color: white;
-    border-radius: 12px;
-    padding: 12px;
 }
 </style>
 """, unsafe_allow_html=True)
 
 
-@st.cache_resource
-def load_model():
-    from sentence_transformers import SentenceTransformer
+# --------------------------- AI MODEL ---------------------------
 
+@st.cache_resource
+def load_embedding_model():
     return SentenceTransformer(
         "sentence-transformers/all-MiniLM-L6-v2",
         device="cpu"
     )
 
 
-def split_text(text, chunk_size=120, overlap=25):
+def get_openai_client():
+
+    api_key = os.getenv("OPENAI_API_KEY", "")
+
+    if not api_key and hasattr(st, "secrets"):
+        try:
+            api_key = st.secrets.get("OPENAI_API_KEY", "")
+        except Exception:
+            pass
+
+    if not api_key:
+        return None
+
+    return OpenAI(api_key=api_key)
+
+
+# --------------------------- DOCUMENT TYPES ---------------------------
+
+SUPPORTED_TYPES = [
+    "pdf",
+    "docx",
+    "txt",
+    "md",
+    "csv",
+    "xlsx",
+    "pptx"
+]
+
+
+# --------------------------- PDF EXTRACTION ---------------------------
+
+def extract_pdf(data):
+
+    parts = []
+
+    with pymupdf.open(
+        stream=data,
+        filetype="pdf"
+    ) as pdf:
+
+        for page_no, page in enumerate(pdf, start=1):
+
+            text = page.get_text("text").strip()
+
+            if text:
+                parts.append((page_no, text))
+
+    return parts
+
+
+# --------------------------- WORD EXTRACTION ---------------------------
+
+def extract_docx(data):
+
+    doc = Document(io.BytesIO(data))
+
+    pieces = [
+        p.text.strip()
+        for p in doc.paragraphs
+        if p.text.strip()
+    ]
+
+    for table in doc.tables:
+
+        for row in table.rows:
+
+            values = [
+                cell.text.strip()
+                for cell in row.cells
+            ]
+
+            if any(values):
+                pieces.append(" | ".join(values))
+
+    return [(None, "\n".join(pieces))] if pieces else []
+
+
+# --------------------------- POWERPOINT EXTRACTION ---------------------------
+
+def extract_pptx(data):
+
+    prs = Presentation(io.BytesIO(data))
+
+    pieces = []
+
+    for slide_no, slide in enumerate(
+        prs.slides,
+        start=1
+    ):
+
+        slide_text = []
+
+        for shape in slide.shapes:
+
+            if (
+                getattr(shape, "has_text_frame", False)
+                and shape.text.strip()
+            ):
+                slide_text.append(shape.text.strip())
+
+            if getattr(shape, "has_table", False):
+
+                for row in shape.table.rows:
+
+                    slide_text.append(
+                        " | ".join(
+                            cell.text.strip()
+                            for cell in row.cells
+                        )
+                    )
+
+        if slide_text:
+            pieces.append(
+                (slide_no, "\n".join(slide_text))
+            )
+
+    return pieces
+
+
+# --------------------------- EXCEL EXTRACTION ---------------------------
+
+def extract_xlsx(data):
+
+    workbook = load_workbook(
+        io.BytesIO(data),
+        read_only=True,
+        data_only=True
+    )
+
+    pieces = []
+
+    for sheet in workbook.worksheets:
+
+        rows = []
+
+        for row in sheet.iter_rows(values_only=True):
+
+            values = [
+                str(value)
+                for value in row
+                if value is not None
+            ]
+
+            if values:
+                rows.append(" | ".join(values))
+
+        if rows:
+
+            pieces.append((
+                None,
+                f"Sheet: {sheet.title}\n"
+                + "\n".join(rows)
+            ))
+
+    workbook.close()
+
+    return pieces
+
+
+# --------------------------- CSV EXTRACTION ---------------------------
+
+def extract_csv(data):
+
+    decoded = data.decode(
+        "utf-8-sig",
+        errors="replace"
+    )
+
+    rows = list(
+        csv.reader(io.StringIO(decoded))
+    )
+
+    text = "\n".join(
+        " | ".join(row)
+        for row in rows
+        if any(cell.strip() for cell in row)
+    )
+
+    return [(None, text)] if text.strip() else []
+
+
+# --------------------------- FILE EXTRACTION ---------------------------
+
+def extract_file(uploaded_file):
+
+    data = uploaded_file.getvalue()
+
+    ext = Path(
+        uploaded_file.name
+    ).suffix.lower().lstrip(".")
+
+    if ext == "pdf":
+        return extract_pdf(data)
+
+    if ext == "docx":
+        return extract_docx(data)
+
+    if ext == "pptx":
+        return extract_pptx(data)
+
+    if ext == "xlsx":
+        return extract_xlsx(data)
+
+    if ext == "csv":
+        return extract_csv(data)
+
+    if ext in ("txt", "md"):
+
+        text = data.decode(
+            "utf-8-sig",
+            errors="replace"
+        )
+
+        return [(None, text)] if text.strip() else []
+
+    raise ValueError(
+        f"Unsupported file type: .{ext}"
+    )
+
+
+# --------------------------- TEXT CHUNKING ---------------------------
+
+def split_text(
+    text,
+    chunk_words=180,
+    overlap=35
+):
+
     words = text.split()
+
+    if not words:
+        return []
+
     chunks = []
 
-    start = 0
+    step = max(
+        1,
+        chunk_words - overlap
+    )
 
-    while start < len(words):
-        end = start + chunk_size
-        chunk = " ".join(words[start:end])
+    for start in range(
+        0,
+        len(words),
+        step
+    ):
 
-        if chunk.strip():
+        chunk = " ".join(
+            words[start:start + chunk_words]
+        ).strip()
+
+        if chunk:
             chunks.append(chunk)
-
-        start += chunk_size - overlap
 
     return chunks
 
 
+# --------------------------- SESSION INITIALIZATION ---------------------------
+
 def initialize_session():
 
-    if "records" not in st.session_state:
-        st.session_state.records = []
+    defaults = {
+        "records": [],
+        "processed_files": set(),
+        "chat_history": [],
+        "uploaded_names": set(),
+    }
 
-    if "processed_files" not in st.session_state:
-        st.session_state.processed_files = set()
+    for key, value in defaults.items():
 
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
+        if key not in st.session_state:
+            st.session_state[key] = value
 
 
-def process_documents(uploaded_files):
+# --------------------------- PROCESS DOCUMENTS ---------------------------
 
-    model = load_model()
+def process_documents(files):
+
+    model = load_embedding_model()
 
     new_records = []
+
     processed_count = 0
+    skipped_count = 0
 
-    progress = st.progress(0)
+    progress = st.progress(
+        0,
+        text="Starting document processing..."
+    )
 
-    for file_index, uploaded_file in enumerate(uploaded_files):
+    for index, uploaded_file in enumerate(files):
 
-        file_bytes = uploaded_file.getvalue()
-        file_hash = hashlib.sha256(file_bytes).hexdigest()
+        raw = uploaded_file.getvalue()
+
+        file_hash = hashlib.sha256(
+            raw
+        ).hexdigest()
 
         if file_hash in st.session_state.processed_files:
+
+            skipped_count += 1
+
+            progress.progress(
+                (index + 1) / len(files),
+                text=f"Already processed: {uploaded_file.name}"
+            )
+
             continue
 
         try:
-            pdf = pymupdf.open(
-                stream=file_bytes,
-                filetype="pdf"
-            )
 
-            for page_number, page in enumerate(pdf, start=1):
+            pages = extract_file(uploaded_file)
 
-                page_text = page.get_text("text")
+            file_chunks = []
 
-                if not page_text.strip():
-                    continue
+            for page_no, page_text in pages:
 
-                chunks = split_text(page_text)
+                for chunk in split_text(page_text):
 
-                for chunk in chunks:
-                    new_records.append({
+                    file_chunks.append({
                         "file": uploaded_file.name,
-                        "page": page_number,
-                        "text": chunk
+                        "page": page_no,
+                        "text": chunk,
                     })
 
-            pdf.close()
+            if not file_chunks:
 
-            st.session_state.processed_files.add(file_hash)
+                raise ValueError(
+                    "No readable text found. "
+                    "If this is a scanned PDF, OCR is required."
+                )
+
+            new_records.extend(file_chunks)
+
+            st.session_state.processed_files.add(
+                file_hash
+            )
+
+            st.session_state.uploaded_names.add(
+                uploaded_file.name
+            )
+
             processed_count += 1
 
-        except Exception as error:
+        except Exception as exc:
+
             st.error(
-                f"Error processing {uploaded_file.name}: {error}"
+                f"Could not process {uploaded_file.name}: {exc}"
             )
 
         progress.progress(
-            (file_index + 1) / len(uploaded_files)
+            (index + 1) / len(files),
+            text=f"Processed {index + 1} of {len(files)} files"
         )
 
     if new_records:
 
-        with st.spinner("Creating document embeddings..."):
+        texts = [
+            record["text"]
+            for record in new_records
+        ]
 
-            texts = [record["text"] for record in new_records]
+        with st.spinner(
+            "Creating searchable document representations..."
+        ):
 
-            embeddings = model.encode(
+            vectors = model.encode(
                 texts,
                 convert_to_numpy=True,
                 normalize_embeddings=True,
-                show_progress_bar=False
+                show_progress_bar=False,
+                batch_size=32,
             )
 
-            for record, embedding in zip(new_records, embeddings):
-                record["embedding"] = embedding
+        for record, vector in zip(
+            new_records,
+            vectors
+        ):
 
-            st.session_state.records.extend(new_records)
+            record["embedding"] = vector
+
+        st.session_state.records.extend(
+            new_records
+        )
 
     progress.empty()
 
-    return processed_count
+    return processed_count, skipped_count
 
 
-def get_answer(question):
+# --------------------------- SEMANTIC SEARCH ---------------------------
 
-    if not st.session_state.records:
+def retrieve_context(
+    question,
+    top_k=5
+):
+
+    records = st.session_state.records
+
+    if not records:
         return []
 
-    model = load_model()
+    model = load_embedding_model()
 
-    question_embedding = model.encode(
+    query_vector = model.encode(
         [question],
         convert_to_numpy=True,
         normalize_embeddings=True
     )[0]
 
-    scores = []
+    scored = []
 
-    for record in st.session_state.records:
+    for record in records:
 
         score = float(
-            np.dot(question_embedding, record["embedding"])
+            np.dot(
+                query_vector,
+                record["embedding"]
+            )
         )
 
-        scores.append((score, record))
+        scored.append(
+            (score, record)
+        )
 
-    scores.sort(
+    scored.sort(
         key=lambda item: item[0],
         reverse=True
     )
 
-    return scores[:3]
+    return scored[:top_k]
 
+
+# --------------------------- AI CHATBOT ---------------------------
+
+def generate_answer(question):
+
+    client = get_openai_client()
+
+    if client is None:
+
+        raise RuntimeError(
+            "AI API key is missing. Add OPENAI_API_KEY "
+            "in Render Environment settings and redeploy."
+        )
+
+    matches = retrieve_context(
+        question,
+        top_k=5
+    )
+
+    context_blocks = []
+
+    for score, record in matches:
+
+        if score < 0.18:
+            continue
+
+        location = (
+            f"page/slide {record['page']}"
+            if record["page"]
+            else "document"
+        )
+
+        context_blocks.append(
+            f"[Document: {record['file']} | {location}]\n"
+            f"{record['text']}"
+        )
+
+    context = "\n\n---\n\n".join(
+        context_blocks
+    ) if context_blocks else (
+        "No strongly relevant passage was found "
+        "in the uploaded documents."
+    )
+
+    system_prompt = """
+You are AcademicQuery AI, a friendly and careful
+university academic assistant.
+
+Chat naturally and clearly, like a helpful tutor.
+
+Answer the student's question directly.
+Explain concepts step by step when useful.
+Use previous conversation messages to understand
+follow-up questions.
+
+Use supplied document excerpts when relevant.
+
+Do not invent university rules, dates, fees,
+attendance requirements, exam schedules or
+official facts.
+
+If uploaded documents do not contain an answer,
+say so plainly.
+
+You may still give general educational explanations,
+but clearly label them as general information rather
+than official university policy.
+
+Do not include website links, URLs, markdown links,
+or suggestions to visit external websites.
+
+You may mention uploaded document filenames and
+page or slide numbers as plain-text references.
+
+Never claim a document says something unless
+the supplied excerpt supports it.
+"""
+
+    messages = [
+        {
+            "role": "system",
+            "content": system_prompt
+        }
+    ]
+
+    for item in st.session_state.chat_history[-10:]:
+
+        if item["role"] in (
+            "user",
+            "assistant"
+        ):
+
+            messages.append({
+                "role": item["role"],
+                "content": item["content"]
+            })
+
+    messages.append({
+        "role": "user",
+        "content": (
+            f"Student question:\n{question}\n\n"
+            f"Relevant uploaded-document excerpts:\n{context}"
+        )
+    })
+
+    response = client.chat.completions.create(
+
+        model=os.getenv(
+            "OPENAI_MODEL",
+            "gpt-4o-mini"
+        ),
+
+        messages=messages,
+
+        temperature=0.3
+    )
+
+    answer = response.choices[0].message.content
+
+    source_records = [
+        record
+        for score, record in matches
+        if score >= 0.18
+    ]
+
+    return (
+        answer or "I could not generate a response.",
+        source_records
+    )
+
+
+# --------------------------- MAIN APPLICATION ---------------------------
 
 initialize_session()
 
-
 st.sidebar.markdown(
-    "<h2 style='text-align:center; color:white;'>SCSVMV</h2>",
+    "<h2 style='text-align:center;color:white;'>SCSVMV</h2>",
     unsafe_allow_html=True
 )
 
-if LOGO_PATH.exists():
-    st.sidebar.image(str(LOGO_PATH), width=140)
-else:
-    st.sidebar.markdown(
-        "<h1 style='text-align:center;'>🎓</h1>",
-        unsafe_allow_html=True
-    )
-
-    st.sidebar.warning("Place logo.jpg inside the assets folder.")
-
 st.sidebar.markdown(
-    """
-    <p style='text-align:center; color:#d5a943;'>
-    AcademicQuery AI
-    </p>
-    """,
+    "<p style='text-align:center;color:#d5a943;'>AcademicQuery AI</p>",
     unsafe_allow_html=True
 )
 
@@ -286,105 +671,145 @@ page = st.sidebar.radio(
 )
 
 
+# --------------------------- HOME ---------------------------
+
 if page == "Home":
 
     st.markdown(
-        '<div class="main-title">SCSVMV Academic Portal</div>',
+        '<div class="main-title">'
+        'SCSVMV Academic Portal</div>',
         unsafe_allow_html=True
     )
 
     st.markdown(
-        '<div class="subtitle">Your Smart University Information Assistant</div>',
+        '<p style="color:#64748b;">'
+        'Your smart university information assistant'
+        '</p>',
         unsafe_allow_html=True
     )
 
     st.markdown("""
     <div class="hero">
-        <h1>Welcome to AcademicQuery AI</h1>
+        <h1>Welcome to AcademicQuery AI 🎓</h1>
         <p>
-        Find university academic information quickly.
-        Ask questions about attendance, syllabus,
-        examinations and university regulations.
+        Upload academic documents and ask questions
+        in a natural conversation.
+        Get clear explanations grounded in your
+        uploaded material.
         </p>
     </div>
     """, unsafe_allow_html=True)
 
-    st.subheader("Explore Academic Services")
-
     col1, col2, col3 = st.columns(3)
 
-    with col1:
-        st.markdown("""
-        <div class="info-card">
-            <h3>🎓 Student Support</h3>
-            <p>Find academic information and university guidelines.</p>
-        </div>
-        """, unsafe_allow_html=True)
+    col1.metric(
+        "Documents loaded",
+        len(st.session_state.uploaded_names)
+    )
 
-    with col2:
-        st.markdown("""
-        <div class="info-card">
-            <h3>🤖 AI Chatbot</h3>
-            <p>Ask questions in simple English and find answers.</p>
-        </div>
-        """, unsafe_allow_html=True)
+    col2.metric(
+        "Searchable sections",
+        len(st.session_state.records)
+    )
 
-    with col3:
-        st.markdown("""
-        <div class="info-card">
-            <h3>📚 Digital Library</h3>
-            <p>Search university regulations and academic PDFs.</p>
-        </div>
-        """, unsafe_allow_html=True)
-
-    st.divider()
-
-    st.subheader("Academic Information Dashboard")
-
-    col1, col2 = st.columns(2)
-
-    document_count = len(set(
-        record["file"] for record in st.session_state.records
-    ))
-
-    with col1:
-        st.metric("Documents Processed", document_count)
-
-    with col2:
-        st.metric("Text Sections", len(st.session_state.records))
+    col3.metric(
+        "Chat messages",
+        len(st.session_state.chat_history)
+    )
 
     st.info(
-        "Select Student Chatbot from the sidebar "
-        "to ask your academic questions."
+        "Open Student Chatbot to upload documents "
+        "and start chatting, or use Admin Upload."
     )
 
 
+# --------------------------- STUDENT CHATBOT ---------------------------
+
 elif page == "Student Chatbot":
 
-    st.title("🤖 Student Academic Chatbot")
+    st.title("🤖 Academic AI Chat")
 
-    st.write("Ask questions about university academic documents.")
+    st.caption(
+        "Upload your documents and ask questions naturally. "
+        "No external links are added to answers."
+    )
 
-    if not st.session_state.records:
-        st.warning(
-            "No documents are available. "
-            "Please upload PDF documents from Admin Upload."
+    with st.expander(
+        "📎 Attach documents to this chat",
+        expanded=not bool(st.session_state.records)
+    ):
+
+        chat_files = st.file_uploader(
+            "Choose documents",
+            type=SUPPORTED_TYPES,
+            accept_multiple_files=True,
+            key="chat_document_uploader",
+            help=(
+                "Supported: PDF, DOCX, TXT, MD, "
+                "CSV, XLSX and PPTX."
+            )
+        )
+
+        if st.button(
+            "Process attached documents",
+            key="process_chat_files"
+        ):
+
+            if chat_files:
+
+                done, skipped = process_documents(
+                    chat_files
+                )
+
+                st.success(
+                    f"Finished: {done} new file(s) "
+                    f"processed; {skipped} already processed."
+                )
+
+            else:
+
+                st.warning(
+                    "Choose at least one document first."
+                )
+
+    if st.session_state.uploaded_names:
+
+        st.caption(
+            "Available in this browser session: "
+            + ", ".join(
+                sorted(st.session_state.uploaded_names)
+            )
         )
 
     for message in st.session_state.chat_history:
 
         with st.chat_message(message["role"]):
-            st.write(message["content"])
+
+            st.markdown(
+                message["content"]
+            )
 
             if message.get("sources"):
-                with st.expander("View Sources"):
-                    for source in message["sources"]:
-                        st.write(
-                            f"File: {source['file']} | Page: {source['page']}"
-                        )
-                        st.write(source["text"])
 
-    question = st.chat_input("Type your academic question here...")
+                with st.expander(
+                    "Document references"
+                ):
+
+                    for source in message["sources"]:
+
+                        loc = (
+                            f" — page/slide {source['page']}"
+                            if source["page"]
+                            else ""
+                        )
+
+                        st.write(
+                            f"**{source['file']}**{loc}"
+                        )
+
+    question = st.chat_input(
+        "Ask anything about your documents or an academic topic..."
+    )
 
     if question:
 
@@ -394,182 +819,195 @@ elif page == "Student Chatbot":
         })
 
         with st.chat_message("user"):
-            st.write(question)
+
+            st.markdown(question)
 
         with st.chat_message("assistant"):
 
-            if not st.session_state.records:
+            try:
 
-                answer = "Please upload academic PDF documents first."
-                st.warning(answer)
-                sources = []
+                with st.spinner(
+                    "Reading your documents and preparing an answer..."
+                ):
 
-            else:
+                    answer, sources = generate_answer(
+                        question
+                    )
 
-                try:
-                    with st.spinner("Searching academic documents..."):
+                st.markdown(answer)
 
-                        results = get_answer(question)
+                if sources:
 
-                    if results and results[0][0] > 0.20:
+                    with st.expander(
+                        "Document references"
+                    ):
 
-                        best_score, best_record = results[0]
+                        unique_sources = {}
 
-                        answer = (
-                            "I found the following relevant information "
-                            "in your university documents:\n\n"
-                            + best_record["text"]
-                        )
+                        for source in sources:
 
-                        st.write(answer)
+                            key = (
+                                source["file"],
+                                source["page"]
+                            )
 
-                        sources = [
-                            record for score, record in results
-                            if score > 0.20
-                        ]
+                            unique_sources[key] = source
 
-                        with st.expander("View Sources"):
+                        for filename, page_no in unique_sources:
 
-                            for source in sources:
+                            loc = (
+                                f" — page/slide {page_no}"
+                                if page_no
+                                else ""
+                            )
 
-                                st.write(f"**File:** {source['file']}")
-                                st.write(f"**Page:** {source['page']}")
-                                st.write(source["text"])
-                                st.divider()
+                            st.write(
+                                f"**{filename}**{loc}"
+                            )
 
-                    else:
+                st.session_state.chat_history.append({
+                    "role": "assistant",
+                    "content": answer,
+                    "sources": sources
+                })
 
-                        answer = (
-                            "Sorry, I could not find relevant information "
-                            "in the uploaded documents."
-                        )
+            except Exception as exc:
 
-                        st.write(answer)
-                        sources = []
+                error_message = str(exc)
 
-                except Exception as error:
+                st.error(error_message)
 
-                    answer = f"An error occurred: {error}"
-                    st.error(answer)
-                    sources = []
+                st.session_state.chat_history.append({
+                    "role": "assistant",
+                    "content": (
+                        "Sorry, I could not answer that yet. "
+                        + error_message
+                    ),
+                    "sources": []
+                })
 
-        st.session_state.chat_history.append({
-            "role": "assistant",
-            "content": answer,
-            "sources": sources
-        })
+    col_a, col_b = st.columns(2)
 
+    with col_a:
+
+        if st.button("Clear chat history"):
+
+            st.session_state.chat_history = []
+
+            st.rerun()
+
+    with col_b:
+
+        if st.button("Clear uploaded documents"):
+
+            st.session_state.records = []
+
+            st.session_state.processed_files = set()
+
+            st.session_state.uploaded_names = set()
+
+            st.session_state.chat_history = []
+
+            st.rerun()
+
+
+# --------------------------- ADMIN UPLOAD ---------------------------
 
 elif page == "Admin Upload":
 
     st.title("📚 Admin Document Upload")
 
     st.write(
-        "Upload university academic PDF documents "
-        "to make them searchable."
+        "Upload university documents to make them "
+        "searchable in this browser session."
     )
 
-    uploaded_files = st.file_uploader(
-        "Choose PDF files",
-        type=["pdf"],
-        accept_multiple_files=True
+    files = st.file_uploader(
+        "Choose documents",
+        type=SUPPORTED_TYPES,
+        accept_multiple_files=True,
+        key="admin_document_uploader"
     )
 
-    if st.button("Process Documents"):
+    if st.button(
+        "Process documents",
+        key="admin_process"
+    ):
 
-        if uploaded_files:
+        if files:
 
-            try:
-                with st.spinner("Processing your documents..."):
+            done, skipped = process_documents(
+                files
+            )
 
-                    count = process_documents(uploaded_files)
-
-                st.success(
-                    f"Processing completed. "
-                    f"{count} new document(s) processed."
-                )
-
-            except Exception as error:
-                st.error(f"Processing failed: {error}")
+            st.success(
+                f"Finished: {done} new file(s) "
+                f"processed; {skipped} already processed."
+            )
 
         else:
-            st.warning("Please select at least one PDF file.")
+
+            st.warning(
+                "Please select at least one document."
+            )
 
     st.divider()
 
-    st.subheader("Uploaded Documents")
+    st.subheader("Processed documents")
 
-    document_names = sorted(set(
-        record["file"] for record in st.session_state.records
-    ))
+    if st.session_state.uploaded_names:
 
-    if document_names:
+        for name in sorted(
+            st.session_state.uploaded_names
+        ):
 
-        for name in document_names:
             st.write("📄", name)
 
     else:
-        st.info("No documents have been processed yet.")
 
-    if st.button("Clear All Processed Documents"):
+        st.info(
+            "No documents processed yet."
+        )
+
+    if st.button(
+        "Clear all documents and chat"
+    ):
 
         st.session_state.records = []
+
         st.session_state.processed_files = set()
+
+        st.session_state.uploaded_names = set()
+
         st.session_state.chat_history = []
 
-        st.success("Processed documents and chat history cleared.")
         st.rerun()
 
 
-elif page == "About Project":
+# --------------------------- ABOUT PROJECT ---------------------------
+
+else:
 
     st.title("About AcademicQuery AI")
 
-    st.write("""
-    AcademicQuery AI is an NLP-based university academic
-    question-answering system.
+    st.write(
+        "AcademicQuery AI is a document-assisted "
+        "university question-answering prototype "
+        "built with Streamlit, semantic retrieval "
+        "and an AI language model."
+    )
 
-    The system helps students find information from
-    uploaded academic PDF documents.
-    """)
+    st.subheader("Supported document types")
 
-    st.subheader("Project Objectives")
+    st.write(
+        "PDF, DOCX, TXT, MD, CSV, XLSX and PPTX."
+    )
 
-    st.write("1. To provide quick academic information.")
-    st.write("2. To reduce manual searching of PDF documents.")
-    st.write("3. To use Natural Language Processing.")
-    st.write("4. To provide relevant answers with document sources.")
-
-    st.subheader("Technologies Used")
-
-    st.write("""
-    - Python
-    - Streamlit
-    - Natural Language Processing
-    - Sentence Transformers
-    - PyMuPDF
-    - NumPy
-    """)
-
-    st.subheader("System Architecture")
-
-    st.write("""
-    Student
-       ↓
-    Streamlit Website
-       ↓
-    Student Question
-       ↓
-    NLP Processing
-       ↓
-    Semantic Search
-       ↓
-    Academic PDF Documents
-       ↓
-    Relevant Answer with Source
-    """)
-
-    st.info(
-        "This is a student project prototype. "
-        "Use verified university documents for accurate information."
+    st.warning(
+        "Scanned/image-only PDFs need OCR before "
+        "their text can be searched. Uploaded "
+        "documents and chat history are currently "
+        "held in the active Streamlit session. "
+        "They are not automatically shared with "
+        "other devices or permanently stored."
     )
